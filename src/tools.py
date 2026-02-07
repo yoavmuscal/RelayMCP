@@ -4,8 +4,8 @@ from typing import Any, Dict, List, Optional
 import httpx
 from dedalus_mcp import tool
 
-from .auth import get_user_from_username
-from .models import (
+from src.auth import get_user_from_username
+from src.models import (
     CheckStatusResponse,
     OrchestrationAction,
     OrchestrationCommand,

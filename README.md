@@ -24,5 +24,7 @@ Defaults:
 ## Run
 
 ```bash
+python3 main.py
+# or
 python3 -m src.server
 ```
