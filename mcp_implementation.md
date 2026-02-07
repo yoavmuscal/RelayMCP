@@ -10,37 +10,36 @@ We will adopt the standard Dedalus MCP project structure:
 RelayMCP/
 ├── .env                  # Environment variables (gitignored)
 ├── .gitignore
-├── pyproject.toml        # Dependency management (uv)
-├── uv.lock
+├── pyproject.toml        # Dependency management
 ├── README.md
 ├── mcp_planning.md       # (Existing) Project Plans
 ├── schema.md             # (Existing) Data Schemas
 └── src/
     ├── __init__.py
     ├── server.py         # Main entry point & server configuration
-    ├── auth.py           # Authentication middleware
+    ├── auth.py           # User authentication helpers
     ├── models.py         # Pydantic data models
     └── tools.py          # Tool definitions (check_status, post_status)
 ```
 
+**Note**: Per Dedalus guidelines, server name must match deployment slug. We're using `relay-mcp`.
+
 ## 2. Dependencies & Configuration
 
 ### `pyproject.toml`
-Match the dependencies from the planning doc and example repo.
+Match the dependencies from the planning doc and Dedalus documentation.
 
 ```toml
 [project]
-name = "dedalus-mcp-server"
+name = "relay-mcp"
 version = "0.1.0"
-description = "MCP Server for Dedalus Labs coordination"
+description = "MCP Server for Dedalus Labs multi-agent coordination"
 requires-python = ">=3.10"
 dependencies = [
     "dedalus-mcp",
-    "mcp",
     "httpx",
-    "pydantic",
-    "python-dotenv",
-    "uvloop; sys_platform != 'win32'"
+    "pydantic>=2.0.0",
+    "python-dotenv"
 ]
 
 [build-system]
@@ -48,16 +47,16 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/dedalus_mcp_server"]
+packages = ["src"]
 ```
 
 ### Environment Variables (`.env`)
 ```bash
 VERCEL_API_URL=https://dedalus-coordination.vercel.app
-MCP_PORT=8000
 LOG_LEVEL=INFO
-GITHUB_TOKEN=... # For testing/local run
 ```
+
+**Note**: Authentication via GitHub OAuth is under development by Dedalus. For now, `username` is passed as a tool parameter.
 
 ## 3. Implementation Steps
 
@@ -105,13 +104,11 @@ class PostStatusResponse(BaseModel):
 ```
 
 ### Step 2: Authentication (`src/auth.py`)
-Implement the `AuthenticatedUser` logic using `dedalus_mcp` context.
+**Note**: Per Dedalus guidelines, authentication is not currently supported. Servers should be stateless.
+For now, we'll pass the username as a required parameter in tool calls until OAuth is available.
 
 ```python
 from dataclasses import dataclass
-from typing import Optional
-from dedalus_mcp.core import get_context
-from mcp.server.fastapi import McpError
 
 @dataclass
 class AuthenticatedUser:
@@ -119,26 +116,12 @@ class AuthenticatedUser:
     name: str = "Unknown"
     email: str = "unknown@example.com"
 
-async def verify_github_token(token: str) -> AuthenticatedUser:
-    # TODO: Implement actual GitHub API verification
-    # For now, return a dummy user or implement basic validation
-    return AuthenticatedUser(login="implemented_user")
-
-async def get_current_user() -> AuthenticatedUser:
-    ctx = get_context()
-    if not ctx or not ctx.request_context.credentials:
-        # Fallback for local testing or raise error
-        # In strict production, raise McpError(-32000, "Missing Credentials")
-        pass
-
-    token = ctx.request_context.credentials.get("GITHUB_TOKEN") if ctx and ctx.request_context.credentials else None
-    if not token:
-        # raise McpError(-32000, "Missing GITHUB_TOKEN")
-        pass
-
-    # Placeholder: if no token, maybe return a mock user for local dev if safe
-    # But per spec, we should validate.
-    return await verify_github_token(token or "dummy")
+def get_user_from_username(username: str) -> AuthenticatedUser:
+    """
+    Simple user object from username.
+    In production, this would integrate with Dedalus OAuth when available.
+    """
+    return AuthenticatedUser(login=username)
 ```
 
 ### Step 3: Tool Definitions (`src/tools.py`)
@@ -147,32 +130,37 @@ Implement `check_status` and `post_status` using `httpx` and the models above.
 ```python
 import os
 import httpx
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dedalus_mcp import tool
 from .models import (
     CheckStatusResponse, PostStatusResponse, OrchestrationCommand,
     OrchestrationAction
 )
-from .auth import get_current_user
+from .auth import get_user_from_username
 
-VERCEL_URL = os.getenv("VERCEL_API_URL")
+VERCEL_URL = os.getenv("VERCEL_API_URL", "https://dedalus-coordination.vercel.app")
 
-@tool()
+@tool(description="Check status of files before editing. Returns orchestration commands.")
 async def check_status(
+    username: str,
     file_paths: List[str], 
     agent_head: str, 
     repo_url: str, 
     branch: str = "main"
-) -> CheckStatusResponse:
+) -> Dict[str, Any]:
     """Check status of files before editing. Returns orchestration commands.
     
     Args:
+        username: GitHub username (required until OAuth is available)
         file_paths: List of file paths (e.g., ["src/auth.ts", "src/db.ts"])
         agent_head: Current git HEAD SHA
         repo_url: Repository URL
-        branch: Git branch name
+        branch: Git branch name (default: "main")
+        
+    Returns:
+        Status response with locks, warnings, and orchestration commands
     """
-    user = await get_current_user()
+    user = get_user_from_username(username)
     
     try:
         async with httpx.AsyncClient() as client:
@@ -188,10 +176,14 @@ async def check_status(
                 timeout=5.0
             )
             resp.raise_for_status()
-            return CheckStatusResponse(**resp.json())
+            data = resp.json()
+            # Validate with Pydantic
+            validated = CheckStatusResponse(**data)
+            return validated.model_dump()
             
     except (httpx.ConnectError, httpx.TimeoutException):
-        return CheckStatusResponse(
+        # Graceful offline mode
+        offline_response = CheckStatusResponse(
             status="OFFLINE",
             repo_head="unknown",
             locks={},
@@ -201,9 +193,11 @@ async def check_status(
                 reason="System Offline"
             )
         )
+        return offline_response.model_dump()
 
-@tool()
+@tool(description="Update lock status for files. Supports atomic multi-file locking.")
 async def post_status(
+    username: str,
     file_paths: List[str], 
     status: str, 
     message: str, 
@@ -211,19 +205,23 @@ async def post_status(
     repo_url: str, 
     branch: str = "main", 
     new_repo_head: Optional[str] = None
-) -> PostStatusResponse:
+) -> Dict[str, Any]:
     """Update lock status for files. Supports atomic multi-file locking.
     
     Args:
-        file_paths: List of file paths
-        status: "READING", "WRITING", or "OPEN"
-        message: Context message
+        username: GitHub username (required until OAuth is available)
+        file_paths: List of file paths (e.g., ["src/auth.ts"])
+        status: Lock status - "READING", "WRITING", or "OPEN"
+        message: Context message about what you're doing
         agent_head: Current git HEAD SHA
         repo_url: Repository URL
-        branch: Git branch name
-        new_repo_head: New HEAD SHA (for OPEN)
+        branch: Git branch name (default: "main")
+        new_repo_head: New HEAD SHA after push (required for OPEN status)
+        
+    Returns:
+        Success status, orphaned dependencies, and orchestration commands
     """
-    user = await get_current_user()
+    user = get_user_from_username(username)
     
     try:
         async with httpx.AsyncClient() as client:
@@ -243,28 +241,49 @@ async def post_status(
             )
             
             if resp.status_code == 409:
-                return PostStatusResponse(
+                # Conflict - file is locked
+                conflict_response = PostStatusResponse(
                     success=False,
-                    orchestration=OrchestrationCommand(action=OrchestrationAction.WAIT, reason="Conflict")
+                    orchestration=OrchestrationCommand(
+                        action=OrchestrationAction.WAIT, 
+                        reason="Conflict: File locked by another user"
+                    )
                 )
+                return conflict_response.model_dump()
                 
             resp.raise_for_status()
-            return PostStatusResponse(**resp.json())
+            data = resp.json()
+            # Validate with Pydantic
+            validated = PostStatusResponse(**data)
+            return validated.model_dump()
             
-    except Exception:
-        return PostStatusResponse(
+    except (httpx.ConnectError, httpx.TimeoutException):
+        # Offline mode - cannot safely acquire locks
+        offline_response = PostStatusResponse(
             success=False,
-            orchestration=OrchestrationCommand(action=OrchestrationAction.STOP, reason="Vercel Offline")
+            orchestration=OrchestrationCommand(
+                action=OrchestrationAction.STOP, 
+                reason="Vercel Offline - Cannot Acquire Lock"
+            )
         )
+        return offline_response.model_dump()
+    except Exception as e:
+        # Other errors
+        error_response = PostStatusResponse(
+            success=False,
+            orchestration=OrchestrationCommand(
+                action=OrchestrationAction.STOP, 
+                reason=f"Error: {str(e)}"
+            )
+        )
+        return error_response.model_dump()
 ```
 
 ### Step 4: Server Entry Point (`src/server.py`)
 Initialize the `MCPServer` and register the tools.
 
 ```python
-import os
 from dedalus_mcp import MCPServer
-from dedalus_mcp.server import TransportSecuritySettings
 from dotenv import load_dotenv
 
 # Import tools to register
@@ -272,36 +291,51 @@ from .tools import check_status, post_status
 
 load_dotenv()
 
-def create_server() -> MCPServer:
-    return MCPServer(
-        name="dedalus-mcp-server",
-        connections=[], 
-        http_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
-        streamable_http_stateless=True,
-    )
+# Server name must match your deployment slug
+server = MCPServer("relay-mcp")
 
-async def main():
-    server = create_server()
-    # Register tools
-    server.collect(check_status, post_status)
-    port = int(os.getenv("MCP_PORT", 8000))
-    await server.serve(port=port)
+# Register tools
+server.collect(check_status, post_status)
 
 if __name__ == "__main__":
     import asyncio
-    asyncio.run(main())
+    asyncio.run(server.serve())
 ```
 
 ## 4. Verification Plan
 
 1.  **Install Dependencies**:
     ```bash
-    uv init
-    uv sync
+    pip install -e .
+    # or with uv:
+    uv pip install -e .
     ```
-2.  **Run Server**:
+
+2.  **Set Environment Variables**:
     ```bash
-    uv run src/server.py
+    cp .env.example .env
+    # Edit .env with your VERCEL_API_URL
     ```
-3.  **Test with MCP Client**:
-    Use an MCP inspector or client to call `check_status` and verify it hits the Vercel API.
+
+3.  **Run Server Locally**:
+    ```bash
+    python -m src.server
+    # Server will start on http://localhost:8000/mcp by default
+    ```
+
+4.  **Test with Dedalus SDK**:
+    ```python
+    from dedalus_labs import AsyncDedalus, DedalusRunner
+    
+    client = AsyncDedalus()
+    runner = DedalusRunner(client)
+    
+    response = await runner.run(
+        input="Check status of src/auth.ts in myrepo",
+        model="anthropic/claude-sonnet-4-20250514",
+        mcp_servers=["http://localhost:8000/mcp"],
+    )
+    ```
+
+5.  **Deploy to Dedalus**:
+    Follow the Dedalus deployment guide to publish your MCP server to the marketplace.
